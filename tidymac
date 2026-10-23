@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""tidymac: find the disk space macOS's Storage settings can't explain, and reclaim it safely.
+
+Scans the places that quietly eat hundreds of gigabytes on a developer's Mac
+(Docker VM disks, local AI models, ML dataset caches, package-manager caches,
+stale app copies, build folders) and deletes only what you pick. Video files
+are never deleted.
+"""
+from __future__ import annotations
+
+import argparse
+import calendar
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+__version__ = "0.1.0"
+
+HOME = Path.home()
+
+VIDEO_EXTS = {
+    ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mts", ".m2ts", ".wmv",
+    ".flv", ".3gp", ".mpg", ".mpeg", ".braw", ".r3d", ".insv", ".lrv",
+}
+PROTECTED_ROOTS = [HOME / "Movies", HOME / "Pictures", HOME / "Music"]
+DEFAULT_PROJECT_ROOTS = [
+    "Desktop", "Documents", "Downloads", "Developer", "Projects", "code",
+    "src", "dev", "repos", "workspace", "GitHub",
+]
+
+SAFE = "safe"
+REVIEW = "review"
+
+
+@dataclass
+class Finding:
+    category: str
+    title: str
+    size: int
+    risk: str
+    note: str = ""
+    paths: List[Path] = field(default_factory=list)
+    commands: List[List[str]] = field(default_factory=list)
+    post: List[List[str]] = field(default_factory=list)
+    last_used: Optional[float] = None
+
+    def to_json(self) -> dict:
+        return {
+            "category": self.category,
+            "title": self.title,
+            "bytes": self.size,
+            "risk": self.risk,
+            "note": self.note,
+            "paths": [str(p) for p in self.paths],
+            "commands": self.commands + self.post,
+            "last_used": self.last_used,
+        }
+
+
+# ---------------------------------------------------------------- helpers
+
+def capture(cmd: List[str], timeout: int = 60) -> Tuple[int, str]:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+    return r.returncode, r.stdout
+
+
+def du_bytes(path: Path) -> int:
+    if not path.exists() and not path.is_symlink():
+        return 0
+    # du exits non-zero on unreadable subfolders but still prints a total.
+    _, out = capture(["du", "-sk", str(path)], timeout=1800)
+    try:
+        return int(out.split()[0]) * 1024
+    except (IndexError, ValueError):
+        return 0
+
+
+def sizes(paths: Iterable[Path]) -> Dict[Path, int]:
+    paths = list(paths)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return dict(zip(paths, pool.map(du_bytes, paths)))
+
+
+def last_used(path: Path) -> Optional[float]:
+    try:
+        newest = path.stat().st_mtime
+        if path.is_dir():
+            for i, child in enumerate(os.scandir(path)):
+                if i > 200:
+                    break
+                newest = max(newest, child.stat(follow_symlinks=False).st_mtime)
+        return newest
+    except OSError:
+        return None
+
+
+def parse_size(text: str) -> int:
+    m = re.match(r"\s*([\d.]+)\s*([kKMGTP]?i?B)?", text or "")
+    if not m:
+        return 0
+    unit = (m.group(2) or "B").upper().replace("I", "")
+    mult = {"B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "PB": 1e15}.get(unit, 1)
+    return int(float(m.group(1)) * mult)
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+def age(ts: Optional[float]) -> str:
+    if not ts:
+        return ""
+    days = (time.time() - ts) / 86400
+    if days < 1:
+        return "used today"
+    if days < 60:
+        return f"last used {days:.0f} days ago"
+    return f"last used {days / 30:.0f} months ago"
+
+
+def data_volume() -> str:
+    return "/System/Volumes/Data" if os.path.ismount("/System/Volumes/Data") else "/"
+
+
+def free_bytes() -> int:
+    return shutil.disk_usage(data_volume()).free
+
+
+def path_findings(category: str, risk: str, items: Iterable[Tuple[Path, str, str]],
+                  min_size: int) -> List[Finding]:
+    items = [(p, t, n) for p, t, n in items if p.exists()]
+    measured = sizes(p for p, _, _ in items)
+    return [
+        Finding(category, title, measured[p], risk, note, paths=[p], last_used=last_used(p))
+        for p, title, note in items
+        if measured[p] >= min_size
+    ]
+
+
+# ---------------------------------------------------------------- scanners
+
+def scan_docker(min_size: int) -> List[Finding]:
+    if not shutil.which("docker"):
+        return []
+    code, out = capture(["docker", "system", "df", "-v", "--format", "{{json .}}"], timeout=90)
+    if code != 0 or not out.strip():
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+
+    images = data.get("Images") or []
+    unused = [i for i in images if str(i.get("Containers")) == "0"]
+    dangling = [i for i in unused if i.get("Repository") == "<none>"]
+    tagged = [i for i in unused if i.get("Repository") != "<none>"]
+    stopped = [c for c in (data.get("Containers") or []) if c.get("State") != "running"]
+    cache = [b for b in (data.get("BuildCache") or []) if not b.get("InUse")]
+
+    post: List[List[str]] = []
+    vm_note = ""
+    if shutil.which("colima") and capture(["colima", "status"], timeout=20)[0] == 0:
+        post = [["colima", "ssh", "--", "sudo", "fstrim", "-a"]]
+        disks = list((HOME / ".colima/_lima/_disks").glob("*/datadisk"))
+        if disks:
+            vm_note = f"; Colima's disk file is {human(sum(map(du_bytes, disks)))} and gets trimmed afterward"
+
+    findings = []
+
+    def add(title, items, size_key, risk, note, cmd):
+        size = sum(parse_size(str(i.get(size_key, ""))) for i in items)
+        if items and size >= min_size:
+            findings.append(Finding("Docker", title, size, risk, note + vm_note,
+                                    commands=[cmd], post=post))
+
+    add(f"Untagged Docker images ({len(dangling)})", dangling, "UniqueSize", SAFE,
+        "leftover layers from rebuilds; no container uses them",
+        ["docker", "image", "prune", "-f"])
+    add(f"Docker build cache ({len(cache)} entries)", cache, "Size", SAFE,
+        "rebuilt on the next docker build", ["docker", "builder", "prune", "-f"])
+    add(f"Stopped Docker containers ({len(stopped)})", stopped, "Size", REVIEW,
+        "anything written inside these containers is lost",
+        ["docker", "container", "prune", "-f"])
+    add(f"Unused tagged Docker images ({len(tagged)})", tagged, "UniqueSize", REVIEW,
+        "removes every image no container uses; docker pull/build restores them",
+        ["docker", "image", "prune", "-a", "-f"])
+    return findings
+
+
+def scan_ollama(min_size: int) -> List[Finding]:
+    models_dir = Path(os.environ.get("OLLAMA_MODELS", HOME / ".ollama/models"))
+    findings = []
+    if shutil.which("ollama"):
+        code, out = capture(["ollama", "list"], timeout=20)
+        if code == 0:
+            for line in out.strip().splitlines()[1:]:
+                parts = re.split(r"\s{2,}", line.strip())
+                if len(parts) < 4:
+                    continue
+                name, _, size, modified = parts[:4]
+                if parse_size(size) >= min_size:
+                    findings.append(Finding(
+                        "AI models", f"Ollama model {name}", parse_size(size), REVIEW,
+                        f"downloaded {modified}; `ollama pull {name}` restores it",
+                        commands=[["ollama", "rm", name]]))
+            return findings
+    return path_findings("AI models", REVIEW, [
+        (models_dir, "Ollama models folder", "start Ollama and rerun to see each model"),
+    ], min_size)
+
+
+def scan_ml_caches(min_size: int) -> List[Finding]:
+    hf_home = Path(os.environ.get("HF_HOME", HOME / ".cache/huggingface"))
+    hub = Path(os.environ.get("HF_HUB_CACHE", hf_home / "hub"))
+    items: List[Tuple[Path, str, str]] = []
+    if hub.is_dir():
+        for d in sorted(hub.iterdir()):
+            kind, sep, repo = d.name.partition("--")
+            if sep and d.is_dir():
+                items.append((d, f"HuggingFace {kind.rstrip('s')} {repo.replace('--', '/')}",
+                              "re-downloads automatically when a script needs it"))
+    redownload = "re-downloads automatically when needed"
+    items += [
+        (hf_home / "datasets", "HuggingFace processed datasets", redownload),
+        (hf_home / "xet", "HuggingFace download cache", redownload),
+        (HOME / ".cache/whisper", "Whisper models", redownload),
+        (HOME / ".cache/torch", "PyTorch model cache", redownload),
+        (HOME / ".cache/clip", "CLIP models", redownload),
+        (HOME / ".keras/models", "Keras models", redownload),
+        (HOME / ".keras/datasets", "Keras datasets", redownload),
+        (HOME / ".insightface", "InsightFace models", redownload),
+        (HOME / ".EasyOCR", "EasyOCR models", redownload),
+        (HOME / ".lmstudio/models", "LM Studio models", "re-download them in LM Studio"),
+        (HOME / ".cache/lm-studio/models", "LM Studio models", "re-download them in LM Studio"),
+    ]
+    return path_findings("AI models", REVIEW, items, min_size)
+
+
+def find_conda() -> Optional[str]:
+    for base in ("anaconda3", "miniconda3", "miniforge3", "mambaforge", "opt/anaconda3"):
+        exe = HOME / base / "bin/conda"
+        if exe.exists():
+            return str(exe)
+    return shutil.which("conda")
+
+
+def scan_package_caches(min_size: int) -> List[Finding]:
+    rebuilt = "re-downloaded automatically the next time it's needed"
+    findings = path_findings("Package caches", SAFE, [
+        (HOME / "Library/Caches/pip", "pip download cache", rebuilt),
+        (HOME / ".npm/_cacache", "npm download cache", rebuilt),
+        (HOME / "Library/Caches/Yarn", "Yarn download cache", rebuilt),
+        (HOME / ".cache/uv", "uv download cache", rebuilt),
+        (HOME / ".cargo/registry/cache", "Cargo crate downloads", rebuilt),
+        (HOME / "Library/Caches/CocoaPods", "CocoaPods cache", rebuilt),
+        (HOME / ".bun/install/cache", "Bun download cache", rebuilt),
+    ], min_size)
+    findings += path_findings("Package caches", REVIEW, [
+        (HOME / ".gradle/caches", "Gradle caches", "next Android/Gradle build re-downloads everything"),
+    ], min_size)
+
+    if shutil.which("brew"):
+        code, out = capture(["brew", "--cache"], timeout=30)
+        cache = Path(out.strip()) if code == 0 and out.strip() else None
+        if cache and cache.exists():
+            size = du_bytes(cache)
+            if size >= min_size:
+                findings.append(Finding("Package caches", "Homebrew downloads and old versions", size,
+                                        SAFE, "installed packages are not affected",
+                                        commands=[["brew", "cleanup", "-s", "--prune=all"]]))
+    conda = find_conda()
+    if conda:
+        # Most of pkgs/ is hard-linked into environments, so ask conda what it can really free.
+        code, out = capture([conda, "clean", "--all", "--dry-run", "--json"], timeout=120)
+        try:
+            report = json.loads(out) if code == 0 else {}
+        except json.JSONDecodeError:
+            report = {}
+        size = sum(int(v.get("total_size") or 0) for k, v in report.items()
+                   if k in ("tarballs", "packages") and isinstance(v, dict))
+        if size >= min_size:
+            findings.append(Finding("Package caches", "Conda package cache", size, SAFE,
+                                    "your environments keep working",
+                                    commands=[[conda, "clean", "-a", "-y"]]))
+    if shutil.which("pnpm"):
+        code, out = capture(["pnpm", "store", "path"], timeout=30)
+        store = Path(out.strip()) if code == 0 and out.strip() else None
+        if store and store.exists():
+            size = du_bytes(store)
+            if size >= min_size:
+                findings.append(Finding("Package caches", "pnpm store (unreferenced packages only)",
+                                        size, SAFE, "size shown is the whole store; prune frees less",
+                                        commands=[["pnpm", "store", "prune"]]))
+    if shutil.which("go"):
+        code, out = capture(["go", "env", "GOMODCACHE"], timeout=30)
+        modcache = Path(out.strip()) if code == 0 and out.strip() else None
+        if modcache and modcache.exists():
+            size = du_bytes(modcache)
+            if size >= min_size:
+                findings.append(Finding("Package caches", "Go module cache", size, REVIEW,
+                                        "next go build re-downloads modules",
+                                        commands=[["go", "clean", "-modcache"]]))
+    return findings
+
+
+def scan_dev_tools(min_size: int) -> List[Finding]:
+    xcode = HOME / "Library/Developer/Xcode"
+    sim = HOME / "Library/Developer/CoreSimulator"
+    caches = HOME / "Library/Caches"
+    safe_items = [
+        (xcode / "DerivedData", "Xcode DerivedData", "Xcode rebuilds it on the next build"),
+        (sim / "Caches", "iOS Simulator caches", "rebuilt automatically"),
+        (caches / "ms-playwright", "Playwright browsers", "`npx playwright install` restores them"),
+        (caches / "Cypress", "Cypress binaries", "reinstalled on next npm install"),
+    ]
+    safe_items += [(d, f"{d.name} symbols", "recreated when you plug in a device")
+                   for d in xcode.glob("* DeviceSupport")]
+    safe_items += [(d, f"Leftover app-update download ({d.name.rsplit('.', 1)[0]})",
+                    "staging files from an app update that already finished")
+                   for d in caches.glob("*.ShipIt")]
+    findings = path_findings("Developer tools", SAFE, safe_items, min_size)
+    findings += path_findings("Developer tools", REVIEW, [
+        (xcode / "Archives", "Xcode archives", "old App Store builds and their crash symbols"),
+    ], min_size)
+
+    if shutil.which("xcrun"):
+        code, out = capture(["xcrun", "simctl", "list", "devices", "unavailable", "-j"], timeout=60)
+        if code == 0:
+            try:
+                devices = [d for group in json.loads(out).get("devices", {}).values() for d in group]
+            except json.JSONDecodeError:
+                devices = []
+            dirs = [sim / "Devices" / d["udid"] for d in devices if d.get("udid")]
+            size = sum(sizes(dirs).values())
+            if size >= min_size:
+                findings.append(Finding("Developer tools", f"Broken simulators ({len(dirs)})", size, SAFE,
+                                        "their iOS version is no longer installed",
+                                        commands=[["xcrun", "simctl", "delete", "unavailable"]]))
+        code, out = capture(["xcrun", "simctl", "runtime", "list", "-j"], timeout=60)
+        if code == 0:
+            try:
+                runtimes = json.loads(out).values()
+            except (json.JSONDecodeError, AttributeError):
+                runtimes = []
+            for rt in runtimes:
+                size = int(rt.get("sizeBytes") or 0)
+                if not rt.get("deletable") or size < min_size:
+                    continue
+                used = rt.get("lastUsedAt")
+                ts = calendar.timegm(time.strptime(used, "%Y-%m-%dT%H:%M:%SZ")) if used else None
+                name = rt.get("runtimeIdentifier", "").rsplit(".", 1)[-1].replace("-", " ", 1).replace("-", ".")
+                findings.append(Finding("Developer tools", f"{name or 'iOS'} Simulator runtime", size,
+                                        REVIEW, "only needed to run iPhone/iPad apps on this Mac",
+                                        commands=[["xcrun", "simctl", "runtime", "delete", rt["identifier"]]],
+                                        last_used=ts))
+    return findings
+
+
+def scan_stale_app_copies(min_size: int) -> List[Finding]:
+    code, out = capture(["getconf", "DARWIN_USER_CACHE_DIR"])
+    if code != 0 or not out.strip():
+        return []
+    x_dir = Path(out.strip()).parent / "X"
+    items = []
+    for app_dir in x_dir.glob("*.code_sign_clone"):
+        clones = sorted(app_dir.glob("code_sign_clone.*"),
+                        key=lambda p: p.stat().st_mtime, reverse=True)
+        app = app_dir.name[: -len(".code_sign_clone")]
+        # The newest copy may belong to the running app, so it is always kept.
+        items += [(c, f"Stale copy of {app}", "a browser makes one per update and forgets to delete it")
+                  for c in clones[1:]]
+    return path_findings("Stale app copies", SAFE, items, min_size)
+
+
+def scan_trash(min_size: int) -> List[Finding]:
+    trash = HOME / ".Trash"
+    try:
+        children = list(trash.iterdir())
+    except OSError:
+        return []
+    size = du_bytes(trash)
+    if not children or size < min_size:
+        return []
+    return [Finding("Trash", f"Trash ({len(children)} items)", size, REVIEW,
+                    "things you already moved to the Trash", paths=children)]
+
+
+ARTIFACT_DIRS = {
+    "node_modules": "npm/yarn/pnpm install brings it back",
+    ".next": "rebuilt by next build/dev",
+    ".nuxt": "rebuilt by nuxt",
+    ".svelte-kit": "rebuilt by svelte-kit",
+    ".turbo": "Turborepo cache",
+    ".parcel-cache": "Parcel cache",
+    "DerivedData": "Xcode rebuilds it",
+}
+ARCHIVE_EXTS = {".dmg", ".pkg", ".iso", ".xip", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar"}
+SKIP_DIRS = {".git", "Library", ".Trash", "Photos Library.photoslibrary"}
+
+
+def classify_dir(path: Path, name: str) -> Optional[str]:
+    if name in ARTIFACT_DIRS:
+        return ARTIFACT_DIRS[name]
+    if (path / "pyvenv.cfg").exists():
+        return "Python virtualenv; recreate it and pip install -r requirements.txt"
+    if name == "target" and ((path / "CACHEDIR.TAG").exists() or (path.parent / "Cargo.toml").exists()):
+        return "Rust build output; cargo build recreates it"
+    if name == "build" and any((path.parent / f).exists() for f in ("build.gradle", "build.gradle.kts")):
+        return "Gradle build output"
+    if name == ".gradle" and path.parent != HOME:
+        return "per-project Gradle cache"
+    return None
+
+
+def walk_projects(roots: List[Path], min_size: int) -> Tuple[List[Tuple[Path, str]], List[Path]]:
+    artifacts: List[Tuple[Path, str]] = []
+    archives: List[Path] = []
+    seen = set()
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            here = Path(dirpath)
+            if any(here == p or p in here.parents for p in PROTECTED_ROOTS):
+                dirnames[:] = []
+                continue
+            keep = []
+            for d in dirnames:
+                full = here / d
+                if d in SKIP_DIRS or full.is_symlink():
+                    continue
+                note = classify_dir(full, d)
+                if note:
+                    if full not in seen:
+                        seen.add(full)
+                        artifacts.append((full, note))
+                elif not d.startswith("."):
+                    keep.append(d)
+            dirnames[:] = keep
+            for f in filenames:
+                full = here / f
+                if full.suffix.lower() in ARCHIVE_EXTS and full not in seen:
+                    try:
+                        if full.stat().st_size >= max(min_size, 500_000_000):
+                            seen.add(full)
+                            archives.append(full)
+                    except OSError:
+                        pass
+    return artifacts, archives
+
+
+def scan_projects(roots: List[Path], min_size: int) -> List[Finding]:
+    artifacts, archives = walk_projects(roots, min_size)
+    measured = sizes(p for p, _ in artifacts)
+    findings = [
+        Finding("Project build folders", str(p.relative_to(HOME)) if HOME in p.parents else str(p),
+                measured[p], REVIEW, note, paths=[p], last_used=last_used(p.parent))
+        for p, note in artifacts if measured[p] >= min_size
+    ]
+    for a in archives:
+        if contains_video(a):
+            continue
+        findings.append(Finding("Big installers and archives",
+                                str(a.relative_to(HOME)) if HOME in a.parents else str(a),
+                                a.stat().st_size, REVIEW,
+                                "installer or archive; check you don't need it",
+                                paths=[a], last_used=a.stat().st_mtime))
+    return findings
+
+
+# ---------------------------------------------------------------- safety
+
+def contains_video(path: Path) -> Optional[str]:
+    if path.is_symlink():
+        return None
+    if path.is_file():
+        if path.suffix.lower() in VIDEO_EXTS:
+            return str(path)
+        if path.suffix.lower() == ".zip":
+            try:
+                with zipfile.ZipFile(path) as z:
+                    for name in z.namelist():
+                        if os.path.splitext(name)[1].lower() in VIDEO_EXTS:
+                            return f"{path} (contains {name})"
+            except (zipfile.BadZipFile, OSError):
+                return f"{path} (unreadable zip)"
+        return None
+    for dirpath, _, filenames in os.walk(path):
+        for f in filenames:
+            if os.path.splitext(f)[1].lower() in VIDEO_EXTS:
+                return os.path.join(dirpath, f)
+    return None
+
+
+def refuse_reason(path: Path) -> Optional[str]:
+    path = path.absolute()
+    if path in (Path("/"), HOME, HOME.parent) or len(path.parts) < 4:
+        return "too close to the root of the disk"
+    if any(path == p or p in path.parents for p in PROTECTED_ROOTS):
+        return "inside a protected media folder"
+    hit = contains_video(path)
+    if hit:
+        return f"contains a video: {hit}"
+    return None
+
+
+def remove(path: Path) -> None:
+    def onerror(func, p, _):
+        os.chmod(p, 0o700)
+        func(p)
+
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, onerror=onerror)
+    else:
+        path.unlink()
+
+
+# ---------------------------------------------------------------- output
+
+def color(text: str, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
+
+
+RISK_LABEL = {SAFE: color("safe  ", "32"), REVIEW: color("review", "33")}
+
+
+def print_report(findings: List[Finding]) -> None:
+    usage = shutil.disk_usage(data_volume())
+    print(f"\nDisk: {human(usage.total)} total, {human(usage.used)} used, "
+          f"{color(human(usage.free) + ' free', '1')}\n")
+    if not findings:
+        print("Nothing big enough to report.")
+        return
+    by_cat: Dict[str, List[Finding]] = {}
+    for f in findings:
+        by_cat.setdefault(f.category, []).append(f)
+    n = 0
+    for cat, items in by_cat.items():
+        print(color(f"{cat}  ({human(sum(f.size for f in items))})", "1"))
+        for f in items:
+            n += 1
+            extra = "; ".join(x for x in (f.note, age(f.last_used)) if x)
+            print(f"  {n:>3}  {RISK_LABEL[f.risk]}  {human(f.size):>9}  {f.title}")
+            if extra:
+                print(f"{'':>26}{color(extra, '2')}")
+        print()
+    safe = sum(f.size for f in findings if f.risk == SAFE)
+    print(f"Safe to delete: {color(human(safe), '32')}    "
+          f"Worth reviewing: {color(human(sum(f.size for f in findings) - safe), '33')}")
+    print(color("Video files are never deleted, even inside folders you select.", "2"))
+
+
+def ordered(findings: List[Finding]) -> List[Finding]:
+    by_cat: Dict[str, List[Finding]] = {}
+    for f in findings:
+        by_cat.setdefault(f.category, []).append(f)
+    out = []
+    for _, items in sorted(by_cat.items(), key=lambda kv: -sum(f.size for f in kv[1])):
+        out += sorted(items, key=lambda f: -f.size)
+    return out
+
+
+def parse_selection(spec: str, findings: List[Finding]) -> List[Finding]:
+    spec = spec.strip().lower()
+    if spec in ("", "none", "q", "quit"):
+        return []
+    if spec == "all":
+        return list(findings)
+    chosen = set()
+    for part in re.split(r"[,\s]+", spec):
+        if not part:
+            continue
+        if part == "safe":
+            chosen |= {i for i, f in enumerate(findings) if f.risk == SAFE}
+        elif re.fullmatch(r"\d+-\d+", part):
+            a, b = map(int, part.split("-"))
+            chosen |= set(range(a - 1, b))
+        elif part.isdigit():
+            chosen.add(int(part) - 1)
+        else:
+            raise ValueError(f"don't understand '{part}'")
+    if any(i < 0 or i >= len(findings) for i in chosen):
+        raise ValueError(f"pick numbers between 1 and {len(findings)}")
+    return [findings[i] for i in sorted(chosen)]
+
+
+# ---------------------------------------------------------------- actions
+
+def execute(selected: List[Finding], dry_run: bool) -> None:
+    before = free_bytes()
+    posts: List[List[str]] = []
+    for f in selected:
+        print(color(f"\n{f.title}  ({human(f.size)})", "1"))
+        for p in f.paths:
+            reason = refuse_reason(p)
+            if reason:
+                print(color(f"  skipped {p}: {reason}", "33"))
+                continue
+            print(f"  {'would delete' if dry_run else 'deleting'} {p}")
+            if not dry_run:
+                try:
+                    remove(p)
+                except OSError as e:
+                    print(color(f"  failed: {e}", "31"))
+        for cmd in f.commands:
+            print(f"  {'would run' if dry_run else 'running'}: {' '.join(cmd)}")
+            if not dry_run:
+                run_visible(cmd)
+        posts += [c for c in f.post if c not in posts]
+    for cmd in posts:
+        print(f"\n{'would run' if dry_run else 'running'}: {' '.join(cmd)}")
+        if not dry_run:
+            run_visible(cmd)
+    if not dry_run:
+        time.sleep(1)
+        print(color(f"\nFreed {human(free_bytes() - before)}. "
+                    f"Now {human(free_bytes())} free.", "1;32"))
+
+
+def run_visible(cmd: List[str]) -> None:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(color(f"  failed: {e}", "31"))
+        return
+    tail = (r.stdout + r.stderr).strip().splitlines()[-2:]
+    for line in tail:
+        print(color(f"    {line}", "2" if r.returncode == 0 else "31"))
+
+
+SCANNERS: List[Tuple[str, Callable[..., List[Finding]]]] = [
+    ("Docker", scan_docker),
+    ("Ollama", scan_ollama),
+    ("AI model caches", scan_ml_caches),
+    ("package caches", scan_package_caches),
+    ("developer tools", scan_dev_tools),
+    ("stale app copies", scan_stale_app_copies),
+    ("Trash", scan_trash),
+]
+
+
+def scan(args) -> List[Finding]:
+    min_size = parse_size(args.min_size)
+    jobs: List[Tuple[str, Callable[[], List[Finding]]]] = [
+        (name, (lambda fn=fn: fn(min_size))) for name, fn in SCANNERS
+    ]
+    if not args.no_projects:
+        roots = [Path(r).expanduser() for r in args.roots] if args.roots else \
+            [HOME / r for r in DEFAULT_PROJECT_ROOTS if (HOME / r).is_dir()]
+        jobs.append(("project folders", lambda: scan_projects(roots, min_size)))
+
+    findings: List[Finding] = []
+    log = sys.stderr if sys.stderr.isatty() and not args.json else None
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = {pool.submit(fn): name for name, fn in jobs}
+        if log:
+            print(f"Scanning {', '.join(futures.values())}...", file=log)
+        for fut in as_completed(futures):
+            try:
+                findings += fut.result()
+            except Exception as e:  # one broken tool shouldn't sink the whole scan
+                print(f"  {futures[fut]} scan failed: {e}", file=sys.stderr)
+            if log:
+                print(f"  done: {futures[fut]}", file=log)
+    return ordered(findings)
+
+
+def main() -> int:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--min-size", default="100MB", help="hide items smaller than this (default 100MB)")
+    common.add_argument("--roots", nargs="+", metavar="DIR",
+                        help="folders to search for project build output (default: Desktop, Documents, ...)")
+    common.add_argument("--no-projects", action="store_true", help="skip searching project folders")
+    common.add_argument("--json", action="store_true", help="print findings as JSON")
+
+    parser = argparse.ArgumentParser(prog="tidymac", description=__doc__.splitlines()[0], parents=[common])
+    parser.add_argument("--version", action="version", version=f"tidymac {__version__}")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("scan", parents=[common], help="show what's taking space (default)")
+    clean = sub.add_parser("clean", parents=[common], help="scan, then delete the items you pick")
+    clean.add_argument("--select", metavar="SPEC",
+                       help="items to delete without asking which, e.g. 'safe', '1,3,5-8', 'all'")
+    clean.add_argument("--dry-run", action="store_true", help="show what would be deleted, delete nothing")
+    clean.add_argument("-y", "--yes", action="store_true", help="skip the final confirmation")
+    args = parser.parse_args()
+
+    if sys.platform != "darwin":
+        print("tidymac only runs on macOS.", file=sys.stderr)
+        return 1
+
+    findings = scan(args)
+    if args.json:
+        print(json.dumps([f.to_json() for f in findings], indent=2))
+        if args.command != "clean":
+            return 0
+    else:
+        print_report(findings)
+    if args.command != "clean" or not findings:
+        if args.command != "clean" and findings:
+            print("\nRun `tidymac clean` to pick what to delete.")
+        return 0
+
+    spec = args.select
+    if spec is None:
+        if not sys.stdin.isatty():
+            print("Pass --select when not running interactively.", file=sys.stderr)
+            return 1
+        spec = input("\nWhat should go? Numbers like 1,3,5-8, 'safe' for every safe item, "
+                     "'all', or Enter to cancel: ")
+    try:
+        selected = parse_selection(spec, findings)
+    except ValueError as e:
+        print(f"Couldn't read that: {e}", file=sys.stderr)
+        return 1
+    if not selected:
+        print("Nothing selected.")
+        return 0
+
+    total = sum(f.size for f in selected)
+    print(f"\nSelected {len(selected)} item(s), about {human(total)}:")
+    for f in selected:
+        print(f"  {human(f.size):>9}  {f.title}")
+    if not args.dry_run and not args.yes:
+        if input("Delete these? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Cancelled.")
+            return 0
+    execute(selected, args.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(130)
