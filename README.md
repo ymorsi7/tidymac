@@ -30,7 +30,7 @@ ships with macOS.
 
 ```sh
 git clone https://github.com/ymorsi7/tidymac.git
-ln -s "$PWD/tidymac/tidymac" /usr/local/bin/tidymac   # or anywhere on your PATH
+sudo ln -s "$PWD/tidymac/tidymac" /usr/local/bin/tidymac   # or anywhere on your PATH
 ```
 
 ## Use
